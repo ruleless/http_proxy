@@ -20,11 +20,13 @@
 #define ErrLog   4
 
 #define LOG(lv, fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
-#define MAX_HEADER 4096
+#define MAX_HEADER 512
 #define HOSTNAME_SIZE 256
 #define BOOL  int
 #define TRUE  1
 #define FALSE 0
+
+#define CONNECTION_RESPONSE "HTTP/1.0 200 Connection established"
 
 typedef struct server_s server_t;
 typedef struct http_tunnel_s http_tunnel_t;
@@ -39,7 +41,7 @@ struct hostname_s
 
 struct server_s
 {
-    int fd;    
+    int fd;
 
     struct event ev_accept;
     struct event_base *evbase;
@@ -49,14 +51,14 @@ struct server_s
 struct http_tunnel_s
 {
     int fd;
-    
+
     BOOL http_connected;
     char header[MAX_HEADER + 1];
     int header_len;
     hostname_t host;
 
     struct timeval timeout;
-    
+
     struct event ev_read;
     struct event ev_write;
 
@@ -72,7 +74,7 @@ struct http_proxy_s
     BOOL connected;
 
     struct timeval timeout;
-    
+
     struct event ev_read;
     struct event ev_write;
 
@@ -86,6 +88,7 @@ static void free_tunnel(http_tunnel_t *tun);
 static void tunnel_recv_cb(evutil_socket_t fd, short event, void *arg);
 static void tunnel_send_cb(evutil_socket_t fd, short event, void *arg);
 static void resolv_cb(int err, struct evutil_addrinfo *ai, void *arg);
+static int reply_estab_msg(http_tunnel_t *tun);
 
 static http_proxy_t *new_proxy(http_tunnel_t *tun, const struct sockaddr *addr, socklen_t addrlen);
 static void free_proxy(http_proxy_t *proxy);
@@ -97,7 +100,7 @@ static int set_nonblock(int fd)
     int s = fcntl(fd, F_GETFL);
     if (s < 0)
         return -1;
-    
+
     if (fcntl(fd, F_SETFL, s|O_NONBLOCK) < 0)
         return -1;
 
@@ -116,7 +119,7 @@ static server_t *new_server(struct event_base *evbase, struct evdns_base *evdns,
         LOG(WarnLog, "create server failed. %s", strerror(errno));
         return NULL;
     }
-    if (set_nonblock(fd) < 0)        
+    if (set_nonblock(fd) < 0)
     {
         LOG(WarnLog, "create server failed. %s", strerror(errno));
         goto err_1;
@@ -144,12 +147,12 @@ static server_t *new_server(struct event_base *evbase, struct evdns_base *evdns,
     s->fd = fd;
     s->evbase = evbase;
     s->evdns = evdns;
-    
+
     event_assign(&s->ev_accept, evbase, fd, EV_READ|EV_PERSIST, accept_cb, s);
     event_add(&s->ev_accept, NULL);
 
     return s;
-    
+
 err_1:
     if (fd >= 0)
         close(fd);
@@ -186,7 +189,7 @@ static void accept_cb(evutil_socket_t fd, short event, void *arg)
     }
 
     return;
-    
+
 err_1:
     if (clifd >= 0)
         close(clifd);
@@ -205,7 +208,7 @@ static http_tunnel_t *new_tunnel(server_t *s, int fd)
 
     tun->fd = fd;
     tun->http_connected = FALSE;
-    tun->header_len = 0;    
+    tun->header_len = 0;
     tun->server = s;
 
     tun->dnsreq = NULL;
@@ -213,7 +216,7 @@ static http_tunnel_t *new_tunnel(server_t *s, int fd)
 
     tun->timeout.tv_sec = 3;
     tun->timeout.tv_usec = 0;
-    
+
     event_assign(&tun->ev_read, s->evbase, fd, EV_READ|EV_PERSIST, tunnel_recv_cb, tun);
     event_assign(&tun->ev_write, s->evbase, fd, EV_WRITE|EV_PERSIST, tunnel_send_cb, tun);
     event_add(&tun->ev_read, &tun->timeout);
@@ -227,11 +230,12 @@ static void free_tunnel(http_tunnel_t *tun)
     {
         if (tun->dnsreq)
             evdns_getaddrinfo_cancel(tun->dnsreq);
-        
+
         event_del(&tun->ev_read);
         event_del(&tun->ev_write);
-        close(tun->fd);
-        
+        if (tun->fd >= 0)
+            close(tun->fd);
+
         free(tun);
     }
 }
@@ -262,7 +266,7 @@ static enum EParseRet parse_header(http_tunnel_t *tun)
     while (isspace(*ptr)) ptr++;
     end_ptr = strstr(ptr, "\r\n");
     assert(end_ptr);
-    
+
     if (end_ptr - ptr > sizeof(tun->host.hostname) - 1)
     {
         LOG(WarnLog, "hostname too long");
@@ -300,7 +304,7 @@ static void tunnel_recv_cb(evutil_socket_t fd, short event, void *arg)
     {
   again:
         n = recv(tun->fd, tun->header + tun->header_len, MAX_HEADER - tun->header_len, 0);
-        
+
         if (n < 0)
         {
             if (EINTR == errno)
@@ -353,7 +357,7 @@ static void tunnel_recv_cb(evutil_socket_t fd, short event, void *arg)
 
         if (dnsreq)
             tun->dnsreq = dnsreq;
-        
+
         return;
     }
 }
@@ -368,20 +372,44 @@ static void resolv_cb(int err, struct evutil_addrinfo *ai, void *arg)
 
     tun->dnsreq = NULL;
     if (err)
-    {        
+    {
         goto err_1;
     }
 
     for (i = 0; ai; ai = ai->ai_next, ++i)
     {
         char buf[128];
-        
+
         if (ai->ai_family == AF_INET)
         {
             struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
             evutil_inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
 
-            LOG(DebugLog, "resolve %s -> %s", tun->host.hostname, buf);
+            LOG(DebugLog, "resolve %s -> %s, now create proxy to %s", tun->host.hostname, buf, buf);
+
+            tun->proxy = new_proxy(tun, (const struct sockaddr *)sin, sizeof(struct sockaddr_in));
+            if (!tun->proxy)
+            {
+                LOG(ErrLog, "create proxy to %s failed", buf);
+                return;
+            }
+            if (tun->proxy->connected && reply_estab_msg(tun) < 0)
+            {
+                LOG(ErrLog, "reply established message failed, shutdown tunnel");
+                free_proxy(tun->proxy);
+                free_tunnel(tun);
+                return;
+            }
+
+            if (tun->proxy->connected)
+            {
+                LOG(DebugLog, "create proxy succuss, proxy is connected");
+            }
+            else
+            {
+                LOG(DebugLog, "create proxy succuss, proxy is connecting");
+            }
+
             return;
         }
     }
@@ -389,6 +417,26 @@ static void resolv_cb(int err, struct evutil_addrinfo *ai, void *arg)
 err_1:
     LOG(InfoLog, "resolve '%s' failed, %s", tun->host.hostname, evutil_gai_strerror(err));
     free_tunnel(tun);
+}
+
+static int reply_estab_msg(http_tunnel_t *tun)
+{
+    char msg[MAX_HEADER + 1];
+    int n, r;
+
+    snprintf(msg, sizeof(msg),
+             "%s\r\n"
+             "\r\n",
+             CONNECTION_RESPONSE);
+    n = strlen(msg);
+
+    if ((r = send(tun->fd, msg, n, 0)) != n)
+    {
+        LOG(ErrLog, "reply established message failed, r=%d, %s", r, strerror(errno));
+        return -1;
+    }
+
+    return 0;
 }
 
 static http_proxy_t *new_proxy(http_tunnel_t *tun, const struct sockaddr *addr, socklen_t addrlen)
@@ -420,7 +468,7 @@ static http_proxy_t *new_proxy(http_tunnel_t *tun, const struct sockaddr *addr, 
     proxy->tun = tun;
     proxy->timeout.tv_sec = 3;
     proxy->timeout.tv_usec = 0;
-    
+
     event_assign(&proxy->ev_read, tun->server->evbase, fd, EV_READ|EV_PERSIST, proxy_recv_cb, proxy);
     event_assign(&proxy->ev_write, tun->server->evbase, fd, EV_WRITE|EV_PERSIST, proxy_send_cb, proxy);
 
@@ -443,6 +491,7 @@ again:
     }
     else
     {
+        event_add(&proxy->ev_read, NULL);
         proxy->connected = TRUE;
     }
 
@@ -460,13 +509,61 @@ err_1:
 }
 
 static void free_proxy(http_proxy_t *proxy)
-{}
+{
+    if (proxy)
+    {
+        proxy->connected = FALSE;
+
+        event_del(&proxy->ev_read);
+        event_del(&proxy->ev_write);
+        if (proxy->fd >= 0)
+            close(proxy->fd);
+
+        free(proxy);
+    }
+}
 
 static void proxy_recv_cb(evutil_socket_t fd, short event, void *arg)
-{}
+{
+}
 
 static void proxy_send_cb(evutil_socket_t fd, short event, void *arg)
-{}
+{
+    http_proxy_t *proxy = (http_proxy_t *)arg;
+    http_tunnel_t *tun = proxy->tun;
+
+    assert(tun && "proxy_send_cb tunnel is null");
+    if (EV_TIMEOUT == event)
+    {
+        LOG(InfoLog, "connect to %s timeout, shutdown tunnel", tun->host.hostname);
+        free_proxy(proxy);
+        free_tunnel(tun);
+        return;
+    }
+
+    int err = 0;
+    socklen_t errlen = sizeof(int);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err != 0)
+    {
+        LOG(ErrLog, "connect to %s error, %s", tun->host.hostname, strerror(err));
+        free_proxy(tun->proxy);
+        free_tunnel(tun);
+        return;
+    }
+
+    proxy->connected = TRUE;
+    if (reply_estab_msg(tun) < 0)
+    {
+        LOG(ErrLog, "reply established message error, shutdown proxy with %s", tun->host.hostname);
+        free_proxy(proxy);
+        free_tunnel(tun);
+        return;
+    }
+
+    event_del(&proxy->ev_write);
+    event_add(&proxy->ev_read, NULL);
+    LOG(DebugLog, "connect to %s success, established message sended", tun->host.hostname);
+}
 
 int main(int argc, char *argv[])
 {
@@ -483,9 +580,9 @@ int main(int argc, char *argv[])
     event_base_dispatch(evbase);
 
     free_server(server);
-    
+
 err_1:
     event_base_free(evbase);
-    
+
     exit(0);
 }
