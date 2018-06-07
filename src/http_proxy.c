@@ -14,6 +14,8 @@
 #include <event2/event_struct.h>
 #include <event2/dns.h>
 
+#include "debug.h"
+
 #define DebugLog 1
 #define InfoLog  2
 #define WarnLog  3
@@ -64,8 +66,6 @@ struct http_tunnel_s
     struct event ev_write;
 
     server_t *server;
-
-    struct evdns_getaddrinfo_request *dnsreq;
     http_proxy_t *proxy;
 
     char buf[MAX_BUF];
@@ -222,13 +222,12 @@ static http_tunnel_t *new_tunnel(server_t *s, int fd)
     tun->header_len = 0;
     tun->server = s;
 
-    tun->dnsreq = NULL;
     tun->proxy = NULL;
     tun->len = 0;
 
     memset(&tun->host, 0, sizeof(tun->host));
 
-    tun->timeout.tv_sec = 3;
+    tun->timeout.tv_sec = 30;
     tun->timeout.tv_usec = 0;
 
     event_assign(&tun->ev_read, s->evbase, fd, EV_READ|EV_PERSIST, tunnel_recv_cb, tun);
@@ -242,9 +241,8 @@ static void free_tunnel(http_tunnel_t *tun)
 {
     if (tun)
     {
-        if (tun->dnsreq)
-            evdns_getaddrinfo_cancel(tun->dnsreq);
-
+        DEBUG_PRINT("free tunnel %p", tun);
+        DEBUG_PRINT_STACK();
         event_del(&tun->ev_read);
         event_del(&tun->ev_write);
         if (tun->fd >= 0)
@@ -308,13 +306,13 @@ static void tunnel_recv_cb(evutil_socket_t fd, short event, void *arg)
 {
     http_tunnel_t *tun = (http_tunnel_t *)arg;
     struct evutil_addrinfo hints;
-    struct evdns_getaddrinfo_request *dnsreq;
     int n;
     enum EParseRet rparse;
 
     if (EV_TIMEOUT == event)
     {
         LOG(DebugLog, "http tunnel timeout");
+        free_proxy(tun->proxy);
         free_tunnel(tun);
         return;
     }
@@ -365,18 +363,15 @@ static void tunnel_recv_cb(evutil_socket_t fd, short event, void *arg)
             return;
         }
 
-        // event_del(&tun->ev_read);
+        event_del(&tun->ev_read);
         tun->http_connected = TRUE;
         LOG(DebugLog, "Host: %s:%d", tun->host.hostname, tun->host.port);
 
         memset(&hints, 0, sizeof(hints));
-        hints.ai_family = PF_UNSPEC;
+        hints.ai_family = PF_INET;
         hints.ai_socktype = SOCK_STREAM;
         hints.ai_flags = EVUTIL_AI_CANONNAME;
-        dnsreq = evdns_getaddrinfo(tun->server->evdns, tun->host.hostname, NULL, &hints, resolv_cb, tun);
-
-        if (dnsreq)
-            tun->dnsreq = dnsreq;
+        evdns_getaddrinfo(tun->server->evdns, tun->host.hostname, NULL, &hints, resolv_cb, tun);
 
         return;
     }
@@ -431,7 +426,6 @@ static void resolv_cb(int err, struct evutil_addrinfo *ai, void *arg)
     http_tunnel_t *tun = (http_tunnel_t *)arg;
     int i;
 
-    tun->dnsreq = NULL;
     if (err)
     {
         goto err_1;
@@ -444,11 +438,16 @@ static void resolv_cb(int err, struct evutil_addrinfo *ai, void *arg)
         if (ai->ai_family == AF_INET)
         {
             struct sockaddr_in *sin = (struct sockaddr_in *)ai->ai_addr;
+            struct sockaddr_in servaddr;
             evutil_inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
+
+            servaddr.sin_addr.s_addr = sin->sin_addr.s_addr;
+            servaddr.sin_port = htons(tun->host.port);
+            servaddr.sin_family = AF_INET;
 
             LOG(DebugLog, "resolve %s -> %s, now create proxy to %s", tun->host.hostname, buf, buf);
 
-            tun->proxy = new_proxy(tun, (const struct sockaddr *)sin, sizeof(struct sockaddr_in));
+            tun->proxy = new_proxy(tun, (const struct sockaddr *)&servaddr, sizeof(servaddr));
             if (!tun->proxy)
             {
                 LOG(ErrLog, "create proxy to %s failed", buf);
@@ -464,6 +463,7 @@ static void resolv_cb(int err, struct evutil_addrinfo *ai, void *arg)
 
             if (tun->proxy->connected)
             {
+                event_add(&tun->ev_read, &tun->timeout); /* begin to recv from client */
                 LOG(DebugLog, "create proxy succuss, proxy is connected");
             }
             else
@@ -542,7 +542,7 @@ again:
         }
         else if (EINPROGRESS == errno)
         {
-            event_add(&proxy->ev_write, &proxy->timeout);
+            event_add(&proxy->ev_write, NULL);
         }
         else
         {
@@ -651,13 +651,14 @@ static void proxy_send_cb(evutil_socket_t fd, short event, void *arg)
     socklen_t errlen = sizeof(int);
     if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err != 0)
     {
-        LOG(ErrLog, "connect to %s error, %s", tun->host.hostname, strerror(err));
+        LOG(ErrLog, "connect to %s:%d error, %s", tun->host.hostname, tun->host.port, strerror(err));
         free_proxy(tun->proxy);
         free_tunnel(tun);
         return;
     }
 
     proxy->connected = TRUE;
+    event_add(&tun->ev_read, &tun->timeout); /* begin to recv from client */
     if (reply_estab_msg(tun) < 0)
     {
         LOG(ErrLog, "reply established message error, shutdown proxy with %s", tun->host.hostname);
@@ -674,10 +675,18 @@ static void proxy_send_cb(evutil_socket_t fd, short event, void *arg)
 int main(int argc, char *argv[])
 {
     struct event_base *evbase = event_base_new();
-    struct evdns_base *evdns = evdns_base_new(evbase, 1);
+    struct evdns_base *evdns = evdns_base_new(evbase, 0);
     server_t *server;
+    int r;
 
-    server = new_server(evbase, evdns, 8080);
+    r = evdns_base_resolv_conf_parse(evdns, DNS_OPTION_NAMESERVERS, "/etc/resolv.conf");
+    if (r < 0)
+    {
+        LOG(ErrLog, "Couldn't configure nameservers");
+        goto err_1;
+    }
+
+    server = new_server(evbase, evdns, 8081);
     if (!server)
     {
         goto err_1;
