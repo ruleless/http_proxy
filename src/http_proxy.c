@@ -9,27 +9,73 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <signal.h>
+#include <time.h>
 
 #include <event2/event.h>
 #include <event2/event_struct.h>
 #include <event2/dns.h>
+#include <event2/event_compat.h>
 
-#include "debug.h"
+#include "thread_env.h"
 
 #define DebugLog 1
 #define InfoLog  2
 #define WarnLog  3
 #define ErrLog   4
 
-#define LOG(lv, fmt, ...) fprintf(stderr, fmt "\n", ##__VA_ARGS__)
-#define MAX_HEADER 512
+#define LOG(lv, fmt, ...)                                               \
+    do {                                                                \
+        char env_[1024] = {0};                                          \
+        time_t t_ = time(NULL);                                         \
+        struct tm *timeinfo_ = localtime(&t_);                          \
+        get_logenv(env_, sizeof(env_));                                 \
+        if (DebugLog == lv) {                                           \
+            fprintf(stderr, "[%04d/%02d/%d %02d:%02d:%02d][" #lv "]"    \
+                    "[%s:%d][%s]" fmt "%s\n",                           \
+                    timeinfo_->tm_year + 1900, timeinfo_->tm_mon + 1,   \
+                    timeinfo_->tm_mday, timeinfo_->tm_hour,             \
+                    timeinfo_->tm_min, timeinfo_->tm_sec,               \
+                    __FILE__, __LINE__, __FUNCTION__,                   \
+                    ##__VA_ARGS__, env_);                               \
+        } else {                                                        \
+            fprintf(stderr, "[%04d/%02d/%d %02d:%02d:%02d][" #lv "]"    \
+                    fmt "%s\n",                                         \
+                    timeinfo_->tm_year + 1900, timeinfo_->tm_mon + 1,   \
+                    timeinfo_->tm_mday, timeinfo_->tm_hour,             \
+                    timeinfo_->tm_min, timeinfo_->tm_sec,               \
+                    ##__VA_ARGS__, env_);                               \
+        }                                                               \
+    } while (0)
+
+#define SNPRINTF(key)                                                   \
+    do {                                                                \
+        const char *env_ = get_thread_env(key);                         \
+        if (env_ && *env_) {                                            \
+            int n_ = snprintf(ptr, end_ptr - ptr, key ":%s ", env_);    \
+            if (n_ < 0 || n_ >= end_ptr - ptr) {                        \
+                return;                                                 \
+            }                                                           \
+            ptr += n_;                                                  \
+        }                                                               \
+    } while(0)
+
+#define MAX_HEADER    512
 #define HOSTNAME_SIZE 256
-#define MAX_BUF 4096
+#define MAX_BUF       4096
+#define TUN_TIMEOUT   60
+#define PROXY_TIMEOUT 60
+
 #define BOOL  int
 #define TRUE  1
 #define FALSE 0
 
 #define CONNECTION_RESPONSE "HTTP/1.0 200 Connection established"
+#define ENV_TUNNEL   "TUNNEL"
+#define ENV_PROXY    "PROXY"
+#define ENV_HOST     "HOST"
+#define ENV_TUNFD    "tunfd"
+#define ENV_PROXYFD  "prxoyfd"
 
 typedef struct server_s server_t;
 typedef struct http_tunnel_s http_tunnel_t;
@@ -70,6 +116,7 @@ struct http_tunnel_s
 
     char buf[MAX_BUF];
     size_t len;
+    char *wptr;
 };
 
 struct http_proxy_s
@@ -86,9 +133,12 @@ struct http_proxy_s
 
     char buf[MAX_BUF];
     size_t len;
+    char *wptr;
 };
 
 static void accept_cb(evutil_socket_t fd, short event, void *arg);
+
+static void signal_cb(evutil_socket_t fd, short event, void *arg);
 
 static http_tunnel_t *new_tunnel(server_t *s, int fd);
 static void free_tunnel(http_tunnel_t *tun);
@@ -112,6 +162,65 @@ static int set_nonblock(int fd)
         return -1;
 
     return 0;
+}
+
+static void get_logenv(char *env, size_t len)
+{
+    char *ptr = env + 1, *end_ptr = env + len;
+
+    SNPRINTF(ENV_TUNNEL);
+    SNPRINTF(ENV_TUNFD);
+    SNPRINTF(ENV_PROXY);
+    SNPRINTF(ENV_PROXYFD);
+    SNPRINTF(ENV_HOST);
+    if (ptr > env + 1)
+    {
+        *env = '<';
+        *(ptr - 1) = '>';
+    }
+}
+
+static void set_tunnel_env(const http_tunnel_t *tun)
+{
+    char t[32], p[32], h[256], tunfd[8], proxyfd[8];
+
+    snprintf(t, sizeof(t), "%p", tun);
+    snprintf(tunfd, sizeof(tunfd), "%d", tun->fd);
+    snprintf(p, sizeof(p), "%p", tun->proxy);
+    if (tun->proxy)
+    {
+        snprintf(proxyfd, sizeof(proxyfd), "%d", tun->proxy->fd);
+        set_thread_env(ENV_PROXYFD, proxyfd);
+    }
+    if (*tun->host.hostname && tun->host.port)
+        snprintf(h, sizeof(h), "%s:%d", tun->host.hostname, tun->host.port);
+    else
+        snprintf(h, sizeof(h), "acquiring");
+    set_thread_env(ENV_TUNNEL, t);
+    set_thread_env(ENV_TUNFD, tunfd);
+    set_thread_env(ENV_PROXY, p);
+    set_thread_env(ENV_HOST, h);
+}
+
+static BOOL valid_hostname(const char *h)
+{
+    while (*h)
+    {
+        if (!isalnum(*h) && *h != '-' && *h != '.')
+        {
+            return FALSE;
+        }
+        h++;
+    }
+
+    return TRUE;
+}
+
+static void signal_cb(evutil_socket_t fd, short event, void *arg)
+{
+    struct event *signal = arg;
+
+    LOG(InfoLog, "signal_cb: got signal %d", event_get_signal(signal));
 }
 
 static server_t *new_server(struct event_base *evbase, struct evdns_base *evdns, int port)
@@ -150,7 +259,7 @@ static server_t *new_server(struct event_base *evbase, struct evdns_base *evdns,
         goto err_1;
     }
 
-    s = (server_t *)malloc(sizeof(server_t));
+    s = (server_t *)calloc(sizeof(*s), 1);
     if (!s)
     {
         goto err_1;
@@ -183,6 +292,7 @@ static void accept_cb(evutil_socket_t fd, short event, void *arg)
     int clifd = accept(s->fd, NULL, NULL);
     http_tunnel_t *tun;
 
+    clear_thread_env();
     if (clifd < 0)
     {
         LOG(WarnLog, "accept client failed, %s", strerror(errno));
@@ -199,6 +309,8 @@ static void accept_cb(evutil_socket_t fd, short event, void *arg)
         goto err_1;
     }
 
+    LOG(DebugLog, "step 1. accept client");
+
     return;
 
 err_1:
@@ -210,7 +322,7 @@ static http_tunnel_t *new_tunnel(server_t *s, int fd)
 {
     http_tunnel_t *tun;
 
-    tun = (http_tunnel_t *)malloc(sizeof(http_tunnel_t));
+    tun = (http_tunnel_t *)calloc(sizeof(*tun), 1);
     if (!tun)
     {
         LOG(WarnLog, "create tunnel failed. no enough memory");
@@ -219,17 +331,21 @@ static http_tunnel_t *new_tunnel(server_t *s, int fd)
 
     tun->fd = fd;
     tun->http_connected = FALSE;
+    *tun->header = '\0';
     tun->header_len = 0;
     tun->server = s;
 
     tun->proxy = NULL;
+    *tun->buf = '\0';
     tun->len = 0;
 
     memset(&tun->host, 0, sizeof(tun->host));
 
-    tun->timeout.tv_sec = 30;
+    tun->timeout.tv_sec = TUN_TIMEOUT;
     tun->timeout.tv_usec = 0;
 
+    set_tunnel_env(tun);
+    LOG(DebugLog, "new tunnel");
     event_assign(&tun->ev_read, s->evbase, fd, EV_READ|EV_PERSIST, tunnel_recv_cb, tun);
     event_assign(&tun->ev_write, s->evbase, fd, EV_WRITE|EV_PERSIST, tunnel_send_cb, tun);
     event_add(&tun->ev_read, &tun->timeout);
@@ -241,8 +357,7 @@ static void free_tunnel(http_tunnel_t *tun)
 {
     if (tun)
     {
-        DEBUG_PRINT("free tunnel %p", tun);
-        DEBUG_PRINT_STACK();
+        LOG(DebugLog, "free tunnel");
         event_del(&tun->ev_read);
         event_del(&tun->ev_write);
         if (tun->fd >= 0)
@@ -298,6 +413,11 @@ static enum EParseRet parse_header(http_tunnel_t *tun)
         if (tun->host.port < 0)
             tun->host.port = 0;
     }
+    if (!valid_hostname(tun->host.hostname))
+    {
+        LOG(InfoLog, "invalid hostname, header:\n%s", tun->header);
+        return ParseRet_Error;
+    }
 
     return ParseRet_Succuss;
 }
@@ -306,15 +426,16 @@ static void tunnel_recv_cb(evutil_socket_t fd, short event, void *arg)
 {
     http_tunnel_t *tun = (http_tunnel_t *)arg;
     struct evutil_addrinfo hints;
-    int n;
+    int n, len;
     enum EParseRet rparse;
 
+    set_tunnel_env(tun);
     if (EV_TIMEOUT == event)
     {
-        LOG(DebugLog, "http tunnel timeout");
+        LOG(InfoLog, "http tunnel timeout");
         free_proxy(tun->proxy);
         free_tunnel(tun);
-        return;
+        goto end;
     }
 
     /* build http proxy tunnel */
@@ -331,26 +452,28 @@ static void tunnel_recv_cb(evutil_socket_t fd, short event, void *arg)
             }
             else if (errno != EWOULDBLOCK && errno != EAGAIN)
             {
-                LOG(InfoLog, "read http tunnel(connecting) failed, %s", strerror(errno));
+                LOG(WarnLog, "read http tunnel(connecting) failed, %s", strerror(errno));
                 free_tunnel(tun);
-                return;
+                goto end;
             }
 
-            return;
+            goto end;
         }
         if (n == 0)
         {
-            LOG(InfoLog, "http tunnel closed");
+            LOG(DebugLog, "http tunnel closed");
             free_tunnel(tun);
-            return;
+            goto end;
         }
 
-        tun->header[n] = '\0';
+        tun->header_len += n;
+        tun->header[tun->header_len] = '\0';
         rparse = parse_header(tun);
         if (ParseRet_Error == rparse)
         {
+            LOG(InfoLog, "parse Http Connection Header failed");
             free_tunnel(tun);
-            return;
+            goto end;
         }
         if (ParseRet_Again == rparse)
         {
@@ -358,14 +481,15 @@ static void tunnel_recv_cb(evutil_socket_t fd, short event, void *arg)
             {
                 LOG(WarnLog, "no enough space to store http header");
                 free_tunnel(tun);
-                return;
+                goto end;
             }
-            return;
+            goto end;
         }
 
         event_del(&tun->ev_read);
         tun->http_connected = TRUE;
-        LOG(DebugLog, "Host: %s:%d", tun->host.hostname, tun->host.port);
+        LOG(DebugLog, "step 2. recv Http Connect Header:\n%s, n:%d, header len:%d",
+            tun->header, n, tun->header_len);
 
         memset(&hints, 0, sizeof(hints));
         hints.ai_family = PF_INET;
@@ -373,18 +497,20 @@ static void tunnel_recv_cb(evutil_socket_t fd, short event, void *arg)
         hints.ai_flags = EVUTIL_AI_CANONNAME;
         evdns_getaddrinfo(tun->server->evdns, tun->host.hostname, NULL, &hints, resolv_cb, tun);
 
-        return;
+        goto end;
     }
 
     /* translate message to proxy connection */
     if (!tun->proxy)
     {
-        LOG(ErrLog, "proxy connection with %s:%d is not ready", tun->host.hostname, tun->host.port);
+        LOG(ErrLog, "proxy connection with %s:%d is not ready",
+            tun->host.hostname, tun->host.port);
         free_tunnel(tun);
-        return;
+        goto end;
     }
 
 again_2:
+    assert(!tun->wptr && "tunnel_recv_cb: !tun->wptr");
     n = recv(tun->fd, tun->buf + tun->len, sizeof(tun->buf) - tun->len, 0);
 
     if (n < 0)
@@ -399,10 +525,10 @@ again_2:
                 tun->host.hostname, tun->host.port, strerror(errno));
             free_proxy(tun->proxy);
             free_tunnel(tun);
-            return;
+            goto end;
         }
 
-        return;
+        goto end;
     }
     if (n == 0)
     {
@@ -410,22 +536,104 @@ again_2:
             tun->host.hostname, tun->host.port);
         free_proxy(tun->proxy);
         free_tunnel(tun);
-        return;
+        goto end;
     }
 
     tun->len += n;
-    send(tun->proxy->fd, tun->buf, tun->len, 0);
+    LOG(DebugLog, "recv from client, n:%d, len:%ld", n, tun->len);
+
+again_3:
+    len = tun->len;
+    n = send(tun->proxy->fd, tun->buf, len, 0);
+    if (n < 0)
+    {
+        if (EINTR == errno)
+        {
+            goto again_3;
+        }
+        else if (EAGAIN == errno || EWOULDBLOCK == errno)
+        {
+            event_del(&tun->ev_read); /* stop to read from client */
+            event_add(&tun->proxy->ev_write, NULL);
+
+            tun->wptr = tun->buf;
+            goto end;
+        }
+
+        LOG(WarnLog, "send to proxy server error, %s", strerror(errno));
+        free_proxy(tun->proxy);
+        free_tunnel(tun);
+        goto end;
+    }
+
+    if (n != len)
+    {
+        event_del(&tun->ev_read); /* stop to read from client */
+        event_add(&tun->proxy->ev_write, NULL);
+
+        tun->wptr = tun->buf + n;
+        goto end;
+    }
+
     tun->len = 0;
+end:
+    clear_thread_env();
 }
 
 static void tunnel_send_cb(evutil_socket_t fd, short event, void *arg)
-{}
+{
+    http_tunnel_t *tun = (http_tunnel_t *)arg;
+    http_proxy_t *proxy = tun->proxy;
+    int n, len;
+
+    assert(event != EV_TIMEOUT && "tunnel_send_cb: event != EV_TIMEOUT");
+    assert(proxy && "tunnel_send_cb: proxy != NULL");
+    assert(proxy->wptr && "tunnel_send_cb: proxy->wptr != NULL");
+    assert(proxy->buf + proxy->len > proxy->wptr && "tunnel_send_cb: buf + len > wptr");
+
+    set_tunnel_env(tun);
+
+again:
+    len = proxy->buf + proxy->len - proxy->wptr;
+    n = send(tun->fd, proxy->wptr, len, 0);
+    if (n < 0)
+    {
+        if (EINTR == errno)
+        {
+            goto again;
+        }
+        else if (EAGAIN == errno || EWOULDBLOCK == errno)
+        {
+            goto end;
+        }
+
+        LOG(WarnLog, "send to client error(in callback), %s", strerror(errno));
+        free_proxy(proxy);
+        free_tunnel(tun);
+        goto end;
+    }
+
+    if (n != len)
+    {
+        proxy->wptr += n;
+        goto end;
+    }
+
+    event_del(&tun->ev_write);
+    event_add(&proxy->ev_read, &proxy->timeout);
+    proxy->wptr = NULL;
+    proxy->len = 0;
+
+end:
+    clear_thread_env();
+}
 
 static void resolv_cb(int err, struct evutil_addrinfo *ai, void *arg)
 {
     http_tunnel_t *tun = (http_tunnel_t *)arg;
     int i;
 
+    set_tunnel_env(tun);
     if (err)
     {
         goto err_1;
@@ -445,39 +653,46 @@ static void resolv_cb(int err, struct evutil_addrinfo *ai, void *arg)
             servaddr.sin_port = htons(tun->host.port);
             servaddr.sin_family = AF_INET;
 
-            LOG(DebugLog, "resolve %s -> %s, now create proxy to %s", tun->host.hostname, buf, buf);
+            LOG(DebugLog, "step 3. resolve %s -> %s, now create proxy to %s:%d",
+                tun->host.hostname, buf, buf, tun->host.port);
 
             tun->proxy = new_proxy(tun, (const struct sockaddr *)&servaddr, sizeof(servaddr));
             if (!tun->proxy)
             {
                 LOG(ErrLog, "create proxy to %s failed", buf);
-                return;
+                free_tunnel(tun);
+                goto end;
             }
             if (tun->proxy->connected && reply_estab_msg(tun) < 0)
             {
                 LOG(ErrLog, "reply established message failed, shutdown tunnel");
                 free_proxy(tun->proxy);
                 free_tunnel(tun);
-                return;
+                goto end;
             }
 
             if (tun->proxy->connected)
             {
+                LOG(DebugLog, "step 4. directed connected to %s:%d", buf, tun->host.port);
                 event_add(&tun->ev_read, &tun->timeout); /* begin to recv from client */
                 LOG(DebugLog, "create proxy succuss, proxy is connected");
             }
             else
             {
-                LOG(DebugLog, "create proxy succuss, proxy is connecting");
+                LOG(DebugLog, "create proxy succuss, proxy to %s:%d is connecting", tun->host.hostname, tun->host.port);
             }
 
-            return;
+            goto end;
         }
     }
 
 err_1:
-    LOG(InfoLog, "resolve '%s' failed, %s", tun->host.hostname, evutil_gai_strerror(err));
+    LOG(DebugLog, "resolve '%s' failed, %s",
+        tun->host.hostname, evutil_gai_strerror(err));
     free_tunnel(tun);
+
+end:
+    clear_thread_env();
 }
 
 static int reply_estab_msg(http_tunnel_t *tun)
@@ -517,17 +732,20 @@ static http_proxy_t *new_proxy(http_tunnel_t *tun, const struct sockaddr *addr, 
         goto err_1;
     }
 
-    proxy = (http_proxy_t *)malloc(sizeof(http_proxy_t));
+    proxy = (http_proxy_t *)calloc(sizeof(*proxy), 1);
     if (!proxy)
     {
         LOG(ErrLog, "create proxy failed, no enough memory");
         goto err_1;
     }
 
+    set_tunnel_env(tun);
+    LOG(DebugLog, "new proxy");
+
     proxy->fd = fd;
     proxy->connected = FALSE;
     proxy->tun = tun;
-    proxy->timeout.tv_sec = 3;
+    proxy->timeout.tv_sec = PROXY_TIMEOUT;
     proxy->timeout.tv_usec = 0;
 
     event_assign(&proxy->ev_read, tun->server->evbase, fd, EV_READ|EV_PERSIST, proxy_recv_cb, proxy);
@@ -573,6 +791,7 @@ static void free_proxy(http_proxy_t *proxy)
 {
     if (proxy)
     {
+        LOG(DebugLog, "free proxy, proxy:%p", proxy);
         proxy->connected = FALSE;
 
         event_del(&proxy->ev_read);
@@ -588,26 +807,30 @@ static void proxy_recv_cb(evutil_socket_t fd, short event, void *arg)
 {
     http_proxy_t *proxy = (http_proxy_t *)arg;
     http_tunnel_t *tun = proxy->tun;
-    int n;
+    int n, len;
 
     assert(tun && "proxy_recv_cb tunnel is null");
+
+    set_tunnel_env(tun);
     if (EV_TIMEOUT == event)
     {
-        LOG(DebugLog, "proxy connection with %s:%d timeout", tun->host.hostname, tun->host.port);
+        LOG(DebugLog, "proxy connection with %s:%d timeout",
+            tun->host.hostname, tun->host.port);
         free_proxy(proxy);
         free_tunnel(tun);
-        return;
+        goto end;
     }
 
     /* recv from remote server and translate to client(by the http tunnel) */
-again:
+again_1:
+    assert(!proxy->wptr && "proxy_recv_cb: !proxy->wptr");
     n = recv(proxy->fd, proxy->buf + proxy->len, sizeof(proxy->buf) - proxy->len, 0);
 
     if (n < 0)
     {
         if (EINTR == errno)
         {
-            goto again;
+            goto again_1;
         }
         else if (errno != EWOULDBLOCK && errno != EAGAIN)
         {
@@ -615,22 +838,60 @@ again:
                 tun->host.hostname, tun->host.port, strerror(errno));
             free_proxy(proxy);
             free_tunnel(tun);
-            return;
+            goto end;
         }
 
-        return;
+        goto end;
     }
     if (n == 0)
     {
-        LOG(InfoLog, "proxy connection with %s:%d closed", tun->host.hostname, tun->host.port);
+        LOG(InfoLog, "proxy connection with %s:%d closed",
+            tun->host.hostname, tun->host.port);
         free_proxy(proxy);
         free_tunnel(tun);
-        return;
+        goto end;
     }
 
     proxy->len += n;
-    send(tun->fd, proxy->buf, proxy->len, proxy->len);
+    LOG(DebugLog, "recv from proxy server, n:%d, len:%ld", n, proxy->len);
+
+again_2:
+    len = proxy->len;
+    n = send(tun->fd, proxy->buf, len, 0);
+    if (n < 0)
+    {
+        if (EINTR == errno)
+        {
+            goto again_2;
+        }
+        else if (EAGAIN == errno || EWOULDBLOCK == errno)
+        {
+            /* send buffer is full */
+            event_del(&proxy->ev_read);
+            event_add(&tun->ev_write, NULL);
+
+            proxy->wptr = proxy->buf;
+            goto end;
+        }
+
+        LOG(WarnLog, "send to client error, %s", strerror(errno));
+        free_tunnel(tun);
+        free_proxy(tun->proxy);
+        goto end;
+    }
+
+    if (n != len)
+    {
+        event_del(&proxy->ev_read);
+        event_add(&tun->ev_write, NULL);
+
+        proxy->wptr = proxy->buf + n;
+        goto end;
+    }
+
     proxy->len = 0;
+end:
+    clear_thread_env();
 }
 
 static void proxy_send_cb(evutil_socket_t fd, short event, void *arg)
@@ -638,46 +899,98 @@ static void proxy_send_cb(evutil_socket_t fd, short event, void *arg)
     http_proxy_t *proxy = (http_proxy_t *)arg;
     http_tunnel_t *tun = proxy->tun;
 
-    assert(tun && "proxy_send_cb tunnel is null");
-    if (EV_TIMEOUT == event)
+    assert(tun && "proxy_send_cb: tunnel is null");
+
+    set_tunnel_env(tun);
+
+    if (proxy->connected)
     {
-        LOG(InfoLog, "connect to %s timeout, shutdown tunnel", tun->host.hostname);
-        free_proxy(proxy);
-        free_tunnel(tun);
-        return;
+        int len, n;
+
+        assert(tun->wptr && "proxy_send_cb: tun->wptr != NULL");
+  again:
+        len = tun->buf + tun->len - tun->wptr;
+        n = send(proxy->fd, tun->wptr, len, 0);
+        if (n < 0)
+        {
+            if (EINTR == errno)
+            {
+                goto again;
+            }
+            else if (EAGAIN == errno || EWOULDBLOCK == errno)
+            {
+                goto end;
+            }
+
+            LOG(WarnLog, "send to proxy server error(in callback), %s", strerror(errno));
+            free_proxy(proxy);
+            free_tunnel(tun);
+            goto end;
+        }
+
+        if (n != len)
+        {
+            tun->wptr += n;
+            goto end;
+        }
+
+        event_del(&proxy->ev_write);
+        event_add(&tun->ev_read, &tun->timeout);
+        tun->wptr = NULL;
+        tun->len = 0;
+    }
+    else
+    {
+        int err = 0;
+        socklen_t errlen = sizeof(int);
+        if (EV_TIMEOUT == event)
+        {
+            LOG(InfoLog, "connect to %s timeout, shutdown tunnel",
+                tun->host.hostname);
+            free_proxy(proxy);
+            free_tunnel(tun);
+            goto end;
+        }
+
+        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err != 0)
+        {
+            LOG(InfoLog, "connect to %s:%d error, reason:%s",
+                tun->host.hostname, tun->host.port, strerror(err));
+            free_proxy(tun->proxy);
+            free_tunnel(tun);
+            goto end;
+        }
+
+        proxy->connected = TRUE;
+        event_add(&tun->ev_read, &tun->timeout); /* begin to recv from client */
+        if (reply_estab_msg(tun) < 0)
+        {
+            LOG(ErrLog, "reply established message error, shutdown proxy with %s",
+                tun->host.hostname);
+            free_proxy(proxy);
+            free_tunnel(tun);
+            goto end;
+        }
+
+        event_del(&proxy->ev_write);
+        event_add(&proxy->ev_read, NULL);
+        LOG(DebugLog, "step 4. async connected to %s:%d", tun->host.hostname, tun->host.port);
     }
 
-    int err = 0;
-    socklen_t errlen = sizeof(int);
-    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 || err != 0)
-    {
-        LOG(ErrLog, "connect to %s:%d error, %s", tun->host.hostname, tun->host.port, strerror(err));
-        free_proxy(tun->proxy);
-        free_tunnel(tun);
-        return;
-    }
-
-    proxy->connected = TRUE;
-    event_add(&tun->ev_read, &tun->timeout); /* begin to recv from client */
-    if (reply_estab_msg(tun) < 0)
-    {
-        LOG(ErrLog, "reply established message error, shutdown proxy with %s", tun->host.hostname);
-        free_proxy(proxy);
-        free_tunnel(tun);
-        return;
-    }
-
-    event_del(&proxy->ev_write);
-    event_add(&proxy->ev_read, NULL);
-    LOG(DebugLog, "connect to %s success, established message sended", tun->host.hostname);
+end:
+    clear_thread_env();
 }
 
 int main(int argc, char *argv[])
 {
     struct event_base *evbase = event_base_new();
     struct evdns_base *evdns = evdns_base_new(evbase, 0);
+    struct event evsig;
     server_t *server;
     int r;
+
+    evsignal_assign(&evsig, evbase, SIGPIPE, signal_cb, &evsig);
+    evsignal_add(&evsig, NULL);
 
     r = evdns_base_resolv_conf_parse(evdns, DNS_OPTION_NAMESERVERS, "/etc/resolv.conf");
     if (r < 0)
