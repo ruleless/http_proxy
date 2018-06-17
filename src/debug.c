@@ -1,3 +1,6 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <stdarg.h>
 #include <execinfo.h>
 
@@ -8,12 +11,12 @@
 void debug_print(const char *fmt, ...)
 {
     va_list args;
-	char buf[1024];
+    char buf[1024];
     FILE *file = fopen(DEBUG_FILE, "at");
 
-	va_start(args, fmt);
-	vsnprintf(buf, sizeof(buf), fmt, args);
-	va_end(args);
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
 
     if (!file)
         return;

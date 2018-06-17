@@ -17,6 +17,7 @@
 #include <event2/dns.h>
 #include <event2/event_compat.h>
 
+#include "util.h"
 #include "thread_env.h"
 
 #define DebugLog 1
@@ -540,7 +541,7 @@ again_2:
     }
 
     tun->len += n;
-    LOG(DebugLog, "recv from client, n:%d, len:%ld", n, tun->len);
+    LOG(DebugLog, "recv from client, n:%d, len:%zu", n, tun->len);
 
 again_3:
     len = tun->len;
@@ -853,7 +854,7 @@ again_1:
     }
 
     proxy->len += n;
-    LOG(DebugLog, "recv from proxy server, n:%d, len:%ld", n, proxy->len);
+    LOG(DebugLog, "recv from proxy server, n:%d, len:%zu", n, proxy->len);
 
 again_2:
     len = proxy->len;

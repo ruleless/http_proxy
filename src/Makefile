@@ -1,5 +1,5 @@
-CFLAGS+=
-LDFLAGS+=-g -levent -lpthread
+CFLAGS+=-g -rdynamic
+LDFLAGS+=-g -rdynamic -levent -lpthread
 
 TARGET:=http_proxy.out
 
