@@ -23,6 +23,7 @@ main
 temp
 tmp
 cat
+http_proxy
 QueueTest
 GPATH
 GRTAGS
