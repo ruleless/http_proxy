@@ -5,19 +5,24 @@
 extern "C" {
 #endif
 
-# define DEBUG_PRINT(fmt, ...)                                     \
-    do { debug_print("[%s:%d][%ld][%s]" fmt, __FILE__, __LINE__, (long)getpid(), __FUNCTION__, ##__VA_ARGS__); } while (0)
+#define DEBUG_PRINT(fmt, ...)                                       \
+    do {                                                            \
+        debug_print("[%s:%d][%ld][%s]" fmt, __FILE__, __LINE__,     \
+                    (long)getpid(), __FUNCTION__, ##__VA_ARGS__);   \
+    } while (0)
 
-# define DEBUG_PRINT_STACK()                                       \
-    do { DEBUG_PRINT("print stackframe"); debug_print_stack(); } while (0)
+#define DEBUG_PRINT_STACK()                                     \
+    do {                                                        \
+        DEBUG_PRINT("print stackframe"); debug_print_stack();   \
+    } while (0)
 
 /*
- * 打印调试日志
+ * 鎵撳嵃璋冭瘯鏃ュ織
  */
 void debug_print(const char *fmt, ...);
 
 /*
- * 打印堆栈
+ * 鎵撳嵃鍫嗘爤
  */
 void debug_print_stack();
 

@@ -11,21 +11,23 @@ void daemonize(const char *path)
 {
     /* Our process ID and Session ID */
     pid_t pid, sid;
+    int nullfd = open("/dev/null", O_RDWR);
+
+    if (nullfd < 0) {
+        exit(EXIT_FAILURE);
+    }
 
     /* Fork off the parent process */
     pid = fork();
-    if (pid < 0)
-    {
+    if (pid < 0) {
         exit(EXIT_FAILURE);
     }
 
     /* If we got a good PID, then
      * we can exit the parent process. */
-    if (pid > 0)
-    {
+    if (pid > 0) {
         FILE *file = fopen(path, "w");
-        if (file == NULL)
-        {
+        if (file == NULL) {
             exit(EXIT_FAILURE);
         }
 
@@ -39,14 +41,12 @@ void daemonize(const char *path)
 
     /* Create a new SID for the child process */
     sid = setsid();
-    if (sid < 0)
-    {
+    if (sid < 0) {
         exit(EXIT_FAILURE);
     }
 
     /* Change the current working directory */
-    if ((chdir("/")) < 0)
-    {
+    if ((chdir("/")) < 0) {
         exit(EXIT_FAILURE);
     }
 
@@ -54,6 +54,10 @@ void daemonize(const char *path)
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
     close(STDERR_FILENO);
+    dup2(nullfd, STDIN_FILENO);
+    dup2(nullfd, STDOUT_FILENO);
+    dup2(nullfd, STDERR_FILENO);
+    close(nullfd);
 }
 
 void print_stack_frames(void (*print)(const char *sym))
@@ -66,14 +70,14 @@ void print_stack_frames(void (*print)(const char *sym))
 
     nptrs = backtrace(buffer, SIZE);
     strings = backtrace_symbols(buffer, nptrs);
-    if (strings == NULL)
-    {
+    if (strings == NULL) {
         perror("backtrace_symbols");
         exit(EXIT_FAILURE);
     }
 
-    for (j = 0; j < nptrs; j++)
+    for (j = 0; j < nptrs; j++) {
         print(strings[j]);
+    }
 
     free(strings);
 

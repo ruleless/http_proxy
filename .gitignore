@@ -9,7 +9,7 @@
 *.idc
 *.ini
 *.user
-*.obj
+*.objs
 *.exe
 *.ilk
 *.pdb
